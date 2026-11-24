@@ -90,9 +90,18 @@ static ms_item_t* path_to_dir(char* path) {
     if (dir_name_len == 0) {
       return target;
     }
-  } else if (path[dir_name_len - 1] == '/') {
+  }
+
+  /* 修复：原代码只在相对路径分支剥尾随斜杠，绝对路径（如 /etc/）走上面的 if
+     后 else if 不执行，导致循环末尾用空串匹配目录名必然失败。
+     这里统一剥掉所有尾随斜杠。 */
+  while (dir_name_len > 0 && path[dir_name_len - 1] == '/') {
     path[dir_name_len - 1] = '\0';
     dir_name_len--;
+  }
+
+  if (dir_name_len == 0) {
+    return target; /* "/" 或 "//" 等纯斜杠形式，语义就是根目录 */
   }
 
   size_t index = 0;
@@ -103,6 +112,16 @@ static ms_item_t* path_to_dir(char* path) {
     }
 
     path[i] = '\0';
+
+    /* 修复：连续斜杠（如 //etc、a//b）会产生空路径段，原代码拿空串去和目录名
+       比较必然失败。POSIX 语义下空的路径段应被忽略。 */
+    if (path[index] == '\0') {
+      index = i + 1;
+      if (i < dir_name_len) {
+        path[i] = '/';
+      }
+      continue;
+    }
 
     if (strcmp("..", path + index) == 0) {
       if (target != &ms.sys_file.root_dir) {
@@ -224,34 +243,40 @@ static int ls_fun(ms_item_t* _item, int argc, char* argv[]) {
       err_dir_found(argv[1]);
       return -1;
     }
+  } else {
+    /* 修复：argc >= 3 时此前 item 保持 NULL，导致空指针解引用崩溃 */
+    err_arg_num();
+    return -1;
   }
 
   om_list_head_t* pos = NULL;
   om_list_for_each(pos, &item->data.as_dir.list) {
-    ms_item_t* item = om_list_entry(pos, ms_item_t, self);
+    /* 修复：原变量名 item 遮蔽了外层的目标目录指针，改名为 child 避免误用 */
+    ms_item_t* child = om_list_entry(pos, ms_item_t, self);
 
-    switch (item->mode) {
+    switch (child->mode) {
       case MS_MODE_DIR:
-        ms_printf("d---   %-15s", item->name);
+        ms_printf("d---   %-15s", child->name);
         break;
       case MS_MODE_FILE: {
-        if (item->data.as_file.data) {
+        if (child->data.as_file.data) {
           ms_printf(
-              "f%c%c%c   %-15s size %d", item->data.as_file.run ? 'x' : '-',
-              item->data.as_file.data ? 'r' : '-',
-              item->data.as_file.data && item->data.as_file.writeable ? 'w'
-                                                                      : '-',
-              item->name, item->data.as_file.size);
+              "f%c%c%c   %-15s size %d",
+              child->data.as_file.run ? 'x' : '-',
+              child->data.as_file.data ? 'r' : '-',
+              child->data.as_file.data && child->data.as_file.writeable ? 'w'
+                                                                        : '-',
+              child->name, child->data.as_file.size);
           break;
         } else {
-          ms_printf("f%c--   %-15s", item->data.as_file.run ? 'x' : '-',
-                    item->name, item->data.as_file.size);
+          ms_printf("f%c--   %-15s", child->data.as_file.run ? 'x' : '-',
+                    child->name, child->data.as_file.size);
           break;
         }
       }
       case MS_MODE_DEV:
-        ms_printf("c-%c%c   %-15s", item->data.as_device.read ? 'r' : '-',
-                  item->data.as_device.write ? 'w' : '-', item->name);
+        ms_printf("c-%c%c   %-15s", child->data.as_device.read ? 'r' : '-',
+                  child->data.as_device.write ? 'w' : '-', child->name);
         break;
     }
 
@@ -363,38 +388,39 @@ static int echo_fun(ms_item_t* item, int argc, char* argv[]) {
       return -1;
     }
 
-    ms_item_t* item = path_to_file(argv[3]);
+    /* 修复：原变量名 item 遮蔽了函数参数 item，改名为 target 避免误用 */
+    ms_item_t* target = path_to_file(argv[3]);
 
-    if (!item) {
+    if (!target) {
       return -1;
     }
 
-    switch (item->mode) {
+    switch (target->mode) {
       case MS_MODE_FILE: {
-        if ((!item->data.as_file.data) || (!item->data.as_file.writeable)) {
+        if ((!target->data.as_file.data) || (!target->data.as_file.writeable)) {
           err_file_write();
           return -1;
         }
 
         size_t count = strnlen(argv[1], MS_MAX_CMD_LENGTH) + 1;
 
-        if (count > item->data.as_file.size) {
-          count = item->data.as_file.size;
+        if (count > target->data.as_file.size) {
+          count = target->data.as_file.size;
         }
 
-        memcpy(item->data.as_file.data, argv[1], count);
+        memcpy(target->data.as_file.data, argv[1], count);
         break;
       }
 
       case MS_MODE_DEV: {
-        if (!item->data.as_device.write) {
+        if (!target->data.as_device.write) {
           err_file_write();
           return -1;
         }
 
         size_t count = strnlen(argv[1], MS_MAX_CMD_LENGTH) + 1;
 
-        item->data.as_device.write(item, argv[1], count);
+        target->data.as_device.write(target, argv[1], count);
 
         break;
       }
@@ -537,19 +563,21 @@ static void ms_prase_cmd(const char* cmd) {
   uint8_t arg_num = 0;
   ms.buff.arg_map[0] = ms.buff.prase_buff;
 
-  strncpy(ms.buff.prase_buff, cmd, MS_MAX_CMD_LENGTH);
+  /* 修复：strncpy 在源串 >= n 时不写终止符，改用 snprintf 保证 null 结尾 */
+  snprintf(ms.buff.prase_buff, MS_MAX_CMD_LENGTH, "%s", cmd);
 
   for (uint16_t i = 0; ms.buff.prase_buff[i] != '\0'; i++) {
     if (ms.buff.prase_buff[i] == ' ') {
       ms.buff.prase_buff[i] = '\0';
       if (ms.buff.prase_buff[i + 1] != ' ') {
+        /* 修复：原代码先 arg_num++ 再判断上限，会越界写 arg_map[MS_MAX_ARG_NUM]。
+           必须先检查剩余空间再写入。 */
+        if (arg_num + 1 >= MS_MAX_ARG_NUM) {
+          break;
+        }
         arg_num++;
         ms.buff.arg_map[arg_num] = ms.buff.prase_buff + i + 1;
       }
-    }
-
-    if (arg_num == MS_MAX_ARG_NUM) {
-      break;
     }
   }
 
@@ -972,8 +1000,10 @@ void ms_start() {
   ms.write(MS_HELLO_MESSAGE, sizeof(MS_HELLO_MESSAGE));
   ms_enter();
   if (sizeof(MS_INIT_COMMAND) > 1) {
-    strncpy(ms.buff.read_buff, MS_INIT_COMMAND, sizeof(MS_INIT_COMMAND));
-    ms.ctrl.index = sizeof(MS_INIT_COMMAND);
+    /* 修复：原代码用 sizeof(MS_INIT_COMMAND) 作 index，包含 '\0' 导致 off-by-one，
+       启动命令接近缓冲区长度时会越界写 read_buff[MS_MAX_CMD_LENGTH] */
+    snprintf(ms.buff.read_buff, MS_MAX_CMD_LENGTH, "%s", MS_INIT_COMMAND);
+    ms.ctrl.index = strlen(ms.buff.read_buff);
     ms_input('\n');
   }
   ms_show_head();
@@ -992,7 +1022,8 @@ ms_item_t* ms_get_home_dir() { return &ms.sys_file.home_dir; }
 ms_item_t* ms_get_userhome_dir() { return &ms.sys_file.user_home_dir; }
 
 ms_status_t ms_path_to_dir(const char* raw_path, ms_item_t** ans) {
-  strncpy(ms.buff.path_prase_buff, raw_path, MS_MAX_CMD_LENGTH);
+  /* 修复：strncpy 不保证 null 终止，改用 snprintf */
+  snprintf(ms.buff.path_prase_buff, MS_MAX_CMD_LENGTH, "%s", raw_path);
   size_t dir_name_len = strlen(ms.buff.path_prase_buff);
   ms_item_t* target = ms.ctrl.cur_dir;
   char* path = ms.buff.path_prase_buff;
@@ -1068,7 +1099,8 @@ ms_status_t ms_path_to_dir(const char* raw_path, ms_item_t** ans) {
 }
 
 ms_status_t ms_path_to_file(const char* raw_path, ms_item_t** ans) {
-  strncpy(ms.buff.path_prase_buff, raw_path, MS_MAX_CMD_LENGTH);
+  /* 修复：strncpy 不保证 null 终止，改用 snprintf */
+  snprintf(ms.buff.path_prase_buff, MS_MAX_CMD_LENGTH, "%s", raw_path);
   char* path = ms.buff.path_prase_buff;
   char* cmd_name = remove_path(path);
 
